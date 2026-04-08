@@ -6,8 +6,9 @@ TinyPNG 批量压缩工具
 失败的图片会记录到 JSON 文件并自动重试直到全部成功
 
 大概比例:
-Pass rate : Round 1=> 71%  Round 2=> 64%  Round 3=> 64% Round 4=> 100%  Final=> 100%
-Image size : before 177.2MB  after 22.2MB  saved 155MB (87.5%)
+Pass rate  : Round 1=> 78%  Round 2=> 74%  Round 3=> 83%  Round 4=> 100%  Final=> 100%
+Image size : before 168.87MB  after 21.15MB  saved 147.72MB (87.5%)
+Total cost : 8m57s
 """
 
 import sys
@@ -15,10 +16,11 @@ import os
 import random
 import time
 import json
-import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib3.util.retry import Retry
 
 try:
     import requests
@@ -53,7 +55,43 @@ def make_headers():
     }
 
 
-def compress_image(src_path: Path, dst_path: Path) -> dict:
+class RateLimiter:
+    """控制请求频率，确保请求间隔不低于 interval 秒"""
+    def __init__(self, interval: float):
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def acquire(self):
+        with self._lock:
+            now = time.time()
+            wait = self._last + self._interval - now
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.time()
+
+
+def create_session() -> requests.Session:
+    """创建带连接池和自动重连的 Session"""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=1,
+        backoff_factor=1,
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=MAX_WORKERS,
+        pool_maxsize=MAX_WORKERS,
+        max_retries=retry,
+    )
+    session.mount("https://", adapter)
+    return session
+
+
+def compress_image(src_path: Path, dst_path: Path, session: requests.Session, limiter: RateLimiter) -> dict:
     """
     压缩单张图片
     返回: {"src": 原路径, "dst": 输出路径, "before": 原大小, "after": 压缩后大小, "ok": bool, "error": str}
@@ -70,22 +108,26 @@ def compress_image(src_path: Path, dst_path: Path) -> dict:
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            limiter.acquire()
+
             with open(src_path, "rb") as f:
-                resp = requests.post(
+                resp = session.post(
                     UPLOAD_URL,
                     data=f.read(),
                     headers=make_headers(),
-                    timeout=120,
+                    timeout=(10, 120),
                 )
 
             if resp.status_code == 429:
-                time.sleep(1)
+                result["error"] = "频率限制 HTTP 429"
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(delay)
                 continue
 
             if resp.status_code != 201:
                 result["error"] = f"上传失败 HTTP {resp.status_code}: {resp.text[:200]}"
                 if attempt < max_retries - 1:
-                    time.sleep(1)
+                    time.sleep(1 + random.uniform(0, 1))
                     continue
                 return result
 
@@ -95,11 +137,11 @@ def compress_image(src_path: Path, dst_path: Path) -> dict:
                 result["error"] = f"未获取到下载链接: {json.dumps(data, ensure_ascii=False)[:200]}"
                 return result
 
-            dl_resp = requests.get(download_url, headers=make_headers(), timeout=120)
+            dl_resp = session.get(download_url, headers=make_headers(), timeout=(10, 120))
             if dl_resp.status_code != 200:
                 result["error"] = f"下载失败 HTTP {dl_resp.status_code}"
                 if attempt < max_retries - 1:
-                    time.sleep(1)
+                    time.sleep(1 + random.uniform(0, 1))
                     continue
                 return result
 
@@ -114,7 +156,8 @@ def compress_image(src_path: Path, dst_path: Path) -> dict:
         except requests.exceptions.RequestException as e:
             result["error"] = str(e)
             if attempt < max_retries - 1:
-                time.sleep(2)
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(delay)
                 continue
 
     return result
@@ -188,9 +231,12 @@ def run_batch(tasks: list[tuple[Path, Path]], total_all: int, done_offset: int, 
     total_after = 0
     done_count = 0
 
+    session = create_session()
+    limiter = RateLimiter(interval=2.0)
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_map = {
-            executor.submit(compress_image, src, dst): (src, dst)
+            executor.submit(compress_image, src, dst, session, limiter): (src, dst)
             for src, dst in tasks
         }
         for future in as_completed(future_map):
@@ -296,7 +342,7 @@ def main():
         retry_round += 1
         fail_count = len(failed)
         print(f"\n--- 第 {retry_round} 轮重试 (剩余 {fail_count} 张失败) ---\n")
-        time.sleep(2)
+        time.sleep(1)
 
         retry_tasks = [(Path(r["src"]), Path(r["dst"])) for r in failed]
         # 重试时不累加 grand_before（这些图片已经统计过原始大小）
