@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import requests\")",
+      "Bash(chmod +x:*)",
+      "Read(//Users/kl/**)"
+    ]
+  }
+}
