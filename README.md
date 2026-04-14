@@ -24,6 +24,9 @@ python3 tinypng.py
 - 保留原始目录结构
 - 实时显示压缩进度和压缩率
 
+## 预览
+<img src="demo1.png" width="200" height="200" alt="App Icon">
+
 ## 依赖
 
 - Python 3.10+
