@@ -36,7 +36,11 @@ SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 UPLOAD_URL = "https://tinypng.com/backend/opt/shrink"
 
 # 并发数
-MAX_WORKERS = 5
+MAX_WORKERS = 10
+
+# 客户端节流间隔（秒）。已用随机 X-Forwarded-For 绕服务端限流，这里保留极小间隔即可，
+# 真正被限速时由 compress_image 内对 429 的指数退避自适应处理。
+RATE_LIMIT_INTERVAL = 0.2
 
 
 def random_ip():
@@ -56,19 +60,53 @@ def make_headers():
 
 
 class RateLimiter:
-    """控制请求频率，确保请求间隔不低于 interval 秒"""
-    def __init__(self, interval: float):
-        self._interval = interval
+    """
+    自适应限流器：
+    - 正常按 min_interval 放行；
+    - 遇到 429 / 连接异常时，由上层调用 on_429() 触发全局冷却并拉长 interval（所有 worker 共享）；
+    - 持续成功后 on_success() 缓慢恢复到 min_interval。
+    目的：避免所有 worker 集体撞墙反复触发 429。
+    """
+    def __init__(self, min_interval: float = 0.2, max_interval: float = 4.0):
+        self._min = min_interval
+        self._max = max_interval
+        self._interval = min_interval
         self._lock = threading.Lock()
         self._last = 0.0
+        self._cooldown_until = 0.0
+        self._success_streak = 0
 
     def acquire(self):
+        while True:
+            with self._lock:
+                now = time.time()
+                if now < self._cooldown_until:
+                    wait = self._cooldown_until - now
+                else:
+                    wait = self._last + self._interval - now
+                    if wait <= 0:
+                        self._last = now
+                        return
+            time.sleep(max(wait, 0.01))
+
+    def on_429(self, cooldown: float = 15.0):
         with self._lock:
-            now = time.time()
-            wait = self._last + self._interval - now
-            if wait > 0:
-                time.sleep(wait)
-            self._last = time.time()
+            self._interval = min(self._max, max(self._interval * 2, 1.0))
+            self._cooldown_until = max(self._cooldown_until, time.time() + cooldown)
+            self._success_streak = 0
+
+    def on_conn_error(self, cooldown: float = 3.0):
+        with self._lock:
+            self._cooldown_until = max(self._cooldown_until, time.time() + cooldown)
+
+    def on_success(self):
+        with self._lock:
+            if self._interval <= self._min:
+                return
+            self._success_streak += 1
+            if self._success_streak >= 15:
+                self._interval = max(self._min, self._interval * 0.7)
+                self._success_streak = 0
 
 
 def create_session() -> requests.Session:
@@ -83,8 +121,8 @@ def create_session() -> requests.Session:
         raise_on_status=False,
     )
     adapter = requests.adapters.HTTPAdapter(
-        pool_connections=MAX_WORKERS,
-        pool_maxsize=MAX_WORKERS,
+        pool_connections=MAX_WORKERS * 2,
+        pool_maxsize=MAX_WORKERS * 2,
         max_retries=retry,
     )
     session.mount("https://", adapter)
@@ -120,14 +158,15 @@ def compress_image(src_path: Path, dst_path: Path, session: requests.Session, li
 
             if resp.status_code == 429:
                 result["error"] = "频率限制 HTTP 429"
-                delay = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(delay)
+                # 触发全局冷却，所有 worker 共同降速，避免集体撞墙
+                limiter.on_429(cooldown=15.0 + random.uniform(0, 5))
                 continue
 
             if resp.status_code != 201:
                 result["error"] = f"上传失败 HTTP {resp.status_code}: {resp.text[:200]}"
+                if 500 <= resp.status_code < 600:
+                    limiter.on_conn_error(cooldown=3.0)
                 if attempt < max_retries - 1:
-                    time.sleep(1 + random.uniform(0, 1))
                     continue
                 return result
 
@@ -151,13 +190,14 @@ def compress_image(src_path: Path, dst_path: Path, session: requests.Session, li
 
             result["after"] = dst_path.stat().st_size
             result["ok"] = True
+            limiter.on_success()
             return result
 
         except requests.exceptions.RequestException as e:
             result["error"] = str(e)
+            # 连接池 / TLS / 超时类错误：大概率是服务端主动断连的副作用，全局冷却一下再继续
+            limiter.on_conn_error(cooldown=3.0 + random.uniform(0, 2))
             if attempt < max_retries - 1:
-                delay = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(delay)
                 continue
 
     return result
@@ -220,7 +260,8 @@ def save_failed_list(fail_file: Path, failed: list[dict]):
         fail_file.unlink()
 
 
-def run_batch(tasks: list[tuple[Path, Path]], total_all: int, done_offset: int, start_time: float):
+def run_batch(tasks: list[tuple[Path, Path]], total_all: int, done_offset: int, start_time: float,
+              session: requests.Session, limiter: RateLimiter):
     """
     并发压缩一批任务
     返回: (成功列表, 失败列表, total_before, total_after)
@@ -230,9 +271,6 @@ def run_batch(tasks: list[tuple[Path, Path]], total_all: int, done_offset: int, 
     total_before = 0
     total_after = 0
     done_count = 0
-
-    session = create_session()
-    limiter = RateLimiter(interval=2.0)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_map = {
@@ -325,9 +363,15 @@ def main():
 
     start_time = time.time()
 
+    # 全局复用 Session 与限流器，避免每轮重建 TLS 连接池
+    session = create_session()
+    limiter = RateLimiter(min_interval=RATE_LIMIT_INTERVAL)
+
     # === 第一轮压缩 ===
     print("--- 第 1 轮压缩 ---\n")
-    succeeded, failed, batch_before, batch_after = run_batch(tasks, total_all, 0, start_time)
+    succeeded, failed, batch_before, batch_after = run_batch(
+        tasks, total_all, 0, start_time, session, limiter
+    )
     print(f"\n  第 1 轮完成，总用时: {format_elapsed(time.time() - start_time)}")
     grand_before += batch_before
     grand_after += batch_after
@@ -351,7 +395,7 @@ def main():
         grand_after -= prev_fail_size
 
         succeeded_retry, failed, batch_before_retry, batch_after_retry = run_batch(
-            retry_tasks, total_all, all_success_count, start_time
+            retry_tasks, total_all, all_success_count, start_time, session, limiter
         )
         grand_after += batch_after_retry
         all_success_count += len(succeeded_retry)
