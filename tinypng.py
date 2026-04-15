@@ -291,7 +291,7 @@ def run_batch(tasks: list[tuple[Path, Path]], total_all: int, done_offset: int, 
                 succeeded.append(r)
             else:
                 total_after += r["before"]
-                status = f"❌ {r['error'][:60]}"
+                status = f"❌ {r['error'][:60]}  ↻ 稍后自动重试"
                 failed.append(r)
 
             name = Path(r["src"]).name
