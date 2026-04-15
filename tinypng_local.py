@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 本地图片批量压缩工具（零云端、秒级完成）
-用法: python3 tinypng_local.py <文件或目录路径>
-输出: 在同级目录生成 <原名>_<时间戳>_local 的压缩结果
+用法:
+  python3 tinypng_local.py <文件或目录路径> [--resize N]
+  --resize N  若图片最大边 > N 像素，先等比降采样到 N，再做编码层压缩；默认不降采样
 
+输出: 在同级目录生成 <原名>_<时间戳>_local 的压缩结果
 依赖（首次使用需 brew 安装）:
   brew install mozjpeg pngquant oxipng webp
 压缩策略:
@@ -12,12 +14,16 @@
   .webp       → cwebp -q 80
 """
 
+import argparse
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +39,7 @@ class Config:
     png_quality_max: int = 80
     oxipng_level: int = 4                  # 0-6，越大越慢但更省；4 是性价比点
     webp_quality: int = 80
+    resize_max: int = 0                    # >0 时启用降采样：图片最大边超过该像素则等比缩小
     supported_exts: frozenset = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 
 
@@ -135,19 +142,62 @@ DISPATCH = {
 }
 
 
+def _resize_to_tmp(src: Path, max_dim: int) -> tuple[Path, bool]:
+    """若图片最大边 > max_dim，等比降采样写到临时文件并返回 (临时路径, True)；
+    否则返回 (原路径, False)。webp/jpeg/png 统一用 Pillow 处理。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        # 首次运行时自动装一次；失败就不降采样，让调用方看到原图
+        os.system(f"{sys.executable} -m pip install Pillow -q")
+        from PIL import Image  # type: ignore
+
+    with Image.open(src) as im:
+        w, h = im.size
+        if max(w, h) <= max_dim:
+            return src, False
+        im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        # 每线程 + PID 避免冲突；保持原后缀让下游 mozjpeg/pngquant/cwebp 识别
+        tid = threading.get_ident()
+        tmp = Path(tempfile.gettempdir()) / f"_tnlocal_{os.getpid()}_{tid}_{src.name}"
+        # 保存时沿用源格式（im.format 在 thumbnail 后仍为原格式）
+        save_kwargs = {}
+        if src.suffix.lower() in (".jpg", ".jpeg"):
+            # 尺寸降采样阶段先保留较高质量，真正的有损重压交给 mozjpeg
+            save_kwargs = {"quality": 95, "subsampling": "keep"}
+        elif src.suffix.lower() == ".webp":
+            save_kwargs = {"quality": 95}
+        im.save(tmp, format=im.format, **save_kwargs)
+        return tmp, True
+
+
 def compress_one(src: Path, dst: Path) -> dict:
     result = {"src": str(src), "dst": str(dst),
               "before": src.stat().st_size, "after": 0, "ok": False, "error": ""}
+    working_src = src
+    tmp_to_clean: Path | None = None
     try:
-        DISPATCH[src.suffix.lower()](src, dst)
+        if CFG.resize_max > 0:
+            working_src, resized = _resize_to_tmp(src, CFG.resize_max)
+            if resized:
+                tmp_to_clean = working_src
+        DISPATCH[src.suffix.lower()](working_src, dst)
         result["after"] = dst.stat().st_size
         # 压完反而变大（常见于已经极致压缩过的图）——直接拷贝原图，保证不劣化
+        # 注意：若启用了 resize，"变大"的基准应是降采样后的输入大小，但以原图为基准更稳妥，
+        # 避免用户启用 resize 后得到比原图更大的文件
         if result["after"] > result["before"]:
             shutil.copy2(src, dst)
             result["after"] = dst.stat().st_size
         result["ok"] = True
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        if tmp_to_clean is not None:
+            try:
+                tmp_to_clean.unlink(missing_ok=True)
+            except Exception:
+                pass
     return result
 
 
@@ -179,10 +229,19 @@ def fmt_elapsed(s: float) -> str:
     return f"{sec}s"
 
 
-def read_path_arg() -> Path:
-    if len(sys.argv) >= 2:
-        raw = sys.argv[1]
-    else:
+def parse_args() -> tuple[Path, int]:
+    """返回 (input_path, resize_max)；没给 path 时走交互式。"""
+    ap = argparse.ArgumentParser(
+        description="本地图片批量压缩 (mozjpeg / pngquant / oxipng / cwebp)",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    ap.add_argument("path", nargs="?", help="图片文件或目录路径")
+    ap.add_argument("--resize", type=int, default=0, metavar="N",
+                    help="若图片最大边 > N 像素，先等比降采样到 N 再做编码压缩；0 表示不降采样")
+    args = ap.parse_args()
+
+    raw = args.path
+    if not raw:
         try:
             raw = input("请拖入文件或目录路径: ").strip().strip("'\"")
         except (EOFError, KeyboardInterrupt):
@@ -195,16 +254,23 @@ def read_path_arg() -> Path:
     if not p.exists():
         print(f"路径不存在: {p}")
         sys.exit(1)
-    return p
+    if args.resize < 0:
+        print("--resize 必须 >= 0")
+        sys.exit(1)
+    return p, args.resize
 
 
 # =========================
 # 主流程
 # =========================
 def main():
+    global CFG
     check_tools()
 
-    input_path = read_path_arg()
+    input_path, resize_max = parse_args()
+    if resize_max > 0:
+        CFG = replace(CFG, resize_max=resize_max)
+
     images = collect_images(input_path)
     if not images:
         print("未找到支持的图片文件")
@@ -227,6 +293,8 @@ def main():
     print(f"  输出: {output_dir}")
     print(f"  图片数量: {len(images)}")
     print(f"  并发数: {CFG.max_workers}")
+    if CFG.resize_max > 0:
+        print(f"  降采样: 最大边 > {CFG.resize_max}px 时等比缩到 {CFG.resize_max}px")
     print("=" * 60 + "\n")
 
     start = time.time()

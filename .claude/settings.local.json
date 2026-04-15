@@ -3,7 +3,10 @@
     "allow": [
       "Bash(python3 -c \"import requests\")",
       "Bash(chmod +x:*)",
-      "Read(//Users/kl/**)"
+      "Read(//Users/kl/**)",
+      "Bash(python3 -m py_compile /Users/ks/Desktop/happy_tiny/tinypng_local.py)",
+      "Bash(bash -n /Users/ks/Desktop/my_git/compress_image_sh/compress.sh)",
+      "Bash(python3 /Users/ks/Desktop/happy_tiny/tinypng_local.py --help)"
     ]
   }
 }
