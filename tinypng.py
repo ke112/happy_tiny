@@ -36,7 +36,7 @@ SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 UPLOAD_URL = "https://tinypng.com/backend/opt/shrink"
 
 # 并发数
-MAX_WORKERS = 10
+MAX_WORKERS = 15
 
 # 客户端节流间隔（秒）。已用随机 X-Forwarded-For 绕服务端限流，这里保留极小间隔即可，
 # 真正被限速时由 compress_image 内对 429 的指数退避自适应处理。
@@ -89,13 +89,14 @@ class RateLimiter:
                         return
             time.sleep(max(wait, 0.01))
 
-    def on_429(self, cooldown: float = 15.0):
+    def on_429(self, cooldown: float = 6.0):
         with self._lock:
-            self._interval = min(self._max, max(self._interval * 2, 1.0))
+            # 温和提升 interval（1.5× 而非 2×），cooldown 控制在 6s 级别避免雪崩式停顿
+            self._interval = min(self._max, max(self._interval * 1.5, 0.8))
             self._cooldown_until = max(self._cooldown_until, time.time() + cooldown)
             self._success_streak = 0
 
-    def on_conn_error(self, cooldown: float = 3.0):
+    def on_conn_error(self, cooldown: float = 1.5):
         with self._lock:
             self._cooldown_until = max(self._cooldown_until, time.time() + cooldown)
 
@@ -104,7 +105,7 @@ class RateLimiter:
             if self._interval <= self._min:
                 return
             self._success_streak += 1
-            if self._success_streak >= 15:
+            if self._success_streak >= 10:
                 self._interval = max(self._min, self._interval * 0.7)
                 self._success_streak = 0
 
@@ -158,8 +159,8 @@ def compress_image(src_path: Path, dst_path: Path, session: requests.Session, li
 
             if resp.status_code == 429:
                 result["error"] = "频率限制 HTTP 429"
-                # 触发全局冷却，所有 worker 共同降速，避免集体撞墙
-                limiter.on_429(cooldown=15.0 + random.uniform(0, 5))
+                # 温和全局降速（由 limiter 默认 6s cooldown 兜底），避免全员冻结拉长总时间
+                limiter.on_429(cooldown=6.0 + random.uniform(0, 3))
                 continue
 
             if resp.status_code != 201:
